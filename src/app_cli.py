@@ -280,6 +280,13 @@ def build_parser():
     s.add_argument("query")
     s.set_defaults(func=cmd_search)
 
+    s = sp.add_parser("receive", help="Add inventory for a part_key.")
+    s.add_argument("part_key")
+    s.add_argument("qty", type=int)
+    s.add_argument("--loc", help="Storage location label")
+    s.set_defaults(func=cmd_receive)
+
+
     return p
 
 def main():
