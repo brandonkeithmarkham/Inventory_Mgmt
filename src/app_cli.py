@@ -25,6 +25,10 @@ def norm_value(s: str) -> str:
     if all(c in simple_chars for c in s):
         return s.lower().replace("ohm", "Ω")
     return s
+    
+def norm_key(s: str) -> str:
+    """Normalize part_key for case-insensitive matching."""
+    return (s or "").strip().lower()
 
 def ref_prefix(reference: str) -> str:
     r = (reference or "").strip()
@@ -221,22 +225,23 @@ def cmd_search(args):
     init_db(args.db)
     con = connect(args.db)
 
-    q = args.query.strip()
-    rows = con.execute(
-        """
+    q = (args.query or "").strip()
+
+    sql = """
         SELECT p.part_key, p.value, p.prefix, p.subtype, s.on_hand, p.location
         FROM parts p
         JOIN stock s ON s.part_id = p.part_id
-        WHERE p.part_key LIKE ?
-           OR p.value LIKE ?
-           OR p.subtype LIKE ?
-           OR p.prefix LIKE ?
-           OR p.location LIKE ?
+        WHERE LOWER(p.part_key) LIKE ?
+           OR LOWER(p.value) LIKE ?
+           OR LOWER(p.subtype) LIKE ?
+           OR LOWER(p.prefix) LIKE ?
+           OR LOWER(p.location) LIKE ?
         ORDER BY p.prefix, p.value, p.subtype
         LIMIT 200
-        """,
-        (f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%"),
-    ).fetchall()
+    """
+
+    like = f"%{q.lower()}%"
+    rows = con.execute(sql, (like, like, like, like, like)).fetchall()
 
     con.close()
     print_table([tuple(r) for r in rows], ["part_key", "value", "prefix", "subtype", "on_hand", "location"])
@@ -248,7 +253,9 @@ def cmd_receive(args):
     part_key = args.part_key
     qty = int(args.qty)
 
-    row = con.execute("SELECT part_id FROM parts WHERE part_key=?", (part_key,)).fetchone()
+    row = con.execute(
+    "SELECT part_id FROM parts WHERE LOWER(part_key)=?",(norm_key(part_key),)).fetchone()
+
     if not row:
         raise SystemExit(f"Unknown part_key: {part_key}")
 
@@ -341,6 +348,89 @@ def cmd_build(args):
         print("\n⚠ Shortages (inventory is now negative due to --force):")
         print_table(shortages, ["part_key", "value", "subtype", "needed", "on_hand", "short_by"])
 
+def cmd_shop(args):
+    init_db(args.db)
+    con = connect(args.db)
+
+    project = args.project.lower()
+    build_qty = int(args.qty)
+
+    proj = con.execute("SELECT project_id FROM projects WHERE name=?", (project,)).fetchone()
+    if not proj:
+        raise SystemExit(f"Unknown project: {project}")
+
+    proj_id = int(proj["project_id"])
+
+    items = con.execute(
+        """
+        SELECT
+          p.part_key, p.value, p.subtype,
+          b.qty_per,
+          s.on_hand
+        FROM bom_items b
+        JOIN parts p ON p.part_id = b.part_id
+        JOIN stock s ON s.part_id = p.part_id
+        WHERE b.project_id = ?
+        ORDER BY p.prefix, p.value, p.subtype
+        """,
+        (proj_id,),
+    ).fetchall()
+
+    out = []
+    for it in items:
+        need = int(it["qty_per"]) * build_qty
+        have = int(it["on_hand"])
+        # how many to buy to be able to build (need - have), but only if short
+        to_order = max(0, need - have)
+        if to_order > 0:
+            out.append((it["part_key"], it["value"], it["subtype"], need, have, to_order))
+
+    con.close()
+
+    print(f"Shopping list for {build_qty}x {project} (does not modify inventory):")
+    print_table(out, ["part_key", "value", "subtype", "needed", "on_hand", "to_order"])
+
+def cmd_receive_csv(args):
+    init_db(args.db)
+    con = connect(args.db)
+
+    path = Path(args.csv)
+    if not path.exists():
+        raise SystemExit(f"File not found: {path}")
+
+    rows = []
+    with open(path, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        required = {"part_key", "qty"}
+        missing = required - set(r.fieldnames or [])
+        if missing:
+            raise SystemExit(f"CSV missing columns: {missing}")
+
+        for row in r:
+            pkey = row["part_key"].strip()
+            qty = int(row["qty"])
+            loc = (row.get("location") or "").strip()
+            rows.append((pkey, qty, loc))
+
+    with con:
+        for pkey, qty, loc in rows:
+            row = con.execute("SELECT part_id FROM parts WHERE LOWER(part_key)=?",(norm_key(pkey),)).fetchone()
+
+            if not row:
+                print(f"⚠ Skipping unknown part_key: {pkey}")
+                continue
+
+            pid = int(row["part_id"])
+            con.execute("UPDATE stock SET on_hand = on_hand + ? WHERE part_id=?", (qty, pid))
+
+            if loc:
+                con.execute("UPDATE parts SET location=? WHERE part_id=?", (loc, pid))
+
+    con.close()
+    print(f"Batch received {len(rows)} items from {path}")
+
+
+
 def build_parser():
     p = argparse.ArgumentParser(description="Inventory Mgmt (Step 1: import BOMs + search).")
     p.add_argument("--db", default="./data/inventory.db", help="SQLite DB path")
@@ -366,6 +456,15 @@ def build_parser():
     s.add_argument("qty", type=int, help="How many pedals to build")
     s.add_argument("--force", action="store_true", help="Allow inventory to go negative")
     s.set_defaults(func=cmd_build)
+
+    s = sp.add_parser("shop", help="Show what to order for a build (does not change inventory).")
+    s.add_argument("project")
+    s.add_argument("qty", type=int)
+    s.set_defaults(func=cmd_shop)
+
+    s = sp.add_parser("receive-csv", help="Batch receive inventory from a CSV file.")
+    s.add_argument("csv", help="CSV with columns: part_key,qty,location(optional)")
+    s.set_defaults(func=cmd_receive_csv)
 
 
     return p

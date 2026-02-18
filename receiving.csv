@@ -1,0 +1,4 @@
+part_key,qty,location
+C|100n|film,100,Film Caps
+R|10k|,500,Resistor Drawer
+D|1n5817|,50,Diodes
