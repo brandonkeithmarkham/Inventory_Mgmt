@@ -4,7 +4,7 @@ import io
 from pathlib import Path
 
 import streamlit as st
-
+import datetime as dt
 
 # ----------------------------
 # DB schema (same as your CLI)
@@ -46,6 +46,136 @@ CREATE TABLE IF NOT EXISTS bom_items (
 );
 """
 
+import datetime as dt
+
+def now_iso() -> str:
+    return dt.datetime.now().replace(microsecond=0).isoformat(sep=" ")
+
+def norm_space(s: str) -> str:
+    return " ".join((s or "").strip().split())
+
+def norm_value(s: str) -> str:
+    s = norm_space(s)
+    if not s:
+        return s
+    simple_chars = set("0123456789.kKmMuUnNpPfFrRΩohmOHM%")
+    if all(c in simple_chars for c in s):
+        return s.lower().replace("ohm", "Ω")
+    return s
+
+def ref_prefix(reference: str) -> str:
+    r = (reference or "").strip()
+    if not r:
+        return "X"
+    first = r.split(",")[0].strip()
+    letters = ""
+    for ch in first:
+        if ch.isalpha():
+            letters += ch.upper()
+        else:
+            break
+    return letters or "X"
+
+def cap_subtype_from_footprint(footprint: str) -> str:
+    fp = (footprint or "").lower()
+    if "film_box_rect" in fp:
+        return "film"
+    if "electro_radial" in fp:
+        return "electrolytic"
+    return "unknown"
+
+def make_part_key(prefix: str, value: str, subtype: str) -> str:
+    return f"{prefix}|{value}|{subtype}"
+
+def read_kicad_bom(csv_path: str):
+    rows = []
+    with open(csv_path, newline="", encoding="utf-8", errors="replace") as f:
+        r = csv.DictReader(f)
+        required = {"Reference", "Value", "Footprint", "Qty", "DNP"}
+        missing = required - set(r.fieldnames or [])
+        if missing:
+            raise ValueError(f"{csv_path}: missing columns: {sorted(missing)}")
+
+        for row in r:
+            dnp = (row.get("DNP") or "").strip()
+            if dnp and dnp.lower() not in ("0", "false", "no", "n", ""):
+                continue
+
+            ref = norm_space(row.get("Reference", ""))
+            val = norm_value(row.get("Value", ""))
+            fp  = norm_space(row.get("Footprint", ""))
+
+            qty_raw = (row.get("Qty") or "").strip()
+            if not qty_raw:
+                continue
+            try:
+                qty = int(float(qty_raw))
+            except ValueError:
+                continue
+            if qty <= 0:
+                continue
+
+            rows.append((ref, val, fp, qty))
+    return rows
+
+def get_or_create_part(con, prefix: str, value: str, subtype: str, footprint: str) -> int:
+    pkey = make_part_key(prefix, value, subtype)
+    row = con.execute("SELECT part_id FROM parts WHERE part_key=?", (pkey,)).fetchone()
+    if row:
+        return int(row["part_id"]) if isinstance(row, sqlite3.Row) else int(row[0])
+
+    cur = con.execute(
+        "INSERT INTO parts(part_key, prefix, value, subtype, example_footprint) VALUES(?,?,?,?,?)",
+        (pkey, prefix, value, subtype, footprint),
+    )
+    pid = int(cur.lastrowid)
+    con.execute("INSERT OR IGNORE INTO stock(part_id, on_hand, min_stock) VALUES(?,0,0)", (pid,))
+    return pid
+
+def import_bom_into_db(con, project: str, csv_path: str) -> None:
+    bom = read_kicad_bom(csv_path)
+
+    with con:
+        con.execute(
+            "INSERT INTO projects(name, source_csv, imported_at) VALUES(?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET source_csv=excluded.source_csv, imported_at=excluded.imported_at",
+            (project, str(Path(csv_path).resolve()), now_iso()),
+        )
+        proj_id = con.execute("SELECT project_id FROM projects WHERE name=?", (project,)).fetchone()
+        proj_id = int(proj_id["project_id"]) if isinstance(proj_id, sqlite3.Row) else int(proj_id[0])
+
+        con.execute("DELETE FROM bom_items WHERE project_id=?", (proj_id,))
+
+        for ref, val, fp, qty in bom:
+            prefix = ref_prefix(ref)
+            subtype = cap_subtype_from_footprint(fp) if prefix == "C" else ""
+            pid = get_or_create_part(con, prefix, val, subtype, fp)
+            con.execute(
+                "INSERT INTO bom_items(project_id, part_id, qty_per) VALUES(?,?,?)",
+                (proj_id, pid, qty),
+            )
+
+def auto_import_boms_if_needed(con, boms_dir: str = "boms") -> dict:
+    """
+    If there are no projects in DB, import all *.csv in boms_dir.
+    Returns a small status dict for logging/UI.
+    """
+    count = con.execute("SELECT COUNT(*) FROM projects").fetchone()
+    count = int(count[0]) if not isinstance(count, sqlite3.Row) else int(list(count)[0])
+    if count > 0:
+        return {"imported": 0, "reason": "projects already exist"}
+
+    p = Path(boms_dir)
+    if not p.exists():
+        return {"imported": 0, "reason": f"boms_dir not found: {boms_dir}"}
+
+    csvs = sorted(p.glob("*.csv"))
+    imported = 0
+    for csv_file in csvs:
+        import_bom_into_db(con, csv_file.stem.lower(), str(csv_file))
+        imported += 1
+
+    return {"imported": imported, "reason": f"imported {imported} BOM(s) from {boms_dir}"}
 
 def init_db(db_path: str) -> None:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -288,6 +418,11 @@ db_path = st.sidebar.text_input("DB path", "./data/inventory.db")
 init_db(db_path)
 
 con = connect(db_path)
+
+status = auto_import_boms_if_needed(con, boms_dir="boms")
+# Optional: show in sidebar while debugging
+st.sidebar.caption(f"BOM auto-import: {status['reason']}")
+
 
 projects = list_projects(con)
 project_names = [p["name"] for p in projects]
