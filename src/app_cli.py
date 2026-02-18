@@ -266,6 +266,81 @@ def cmd_receive(args):
     print(f"Added {qty} to {part_key}")
     con.close()
 
+def cmd_build(args):
+    init_db(args.db)
+    con = connect(args.db)
+
+    project = args.project.lower()
+    build_qty = int(args.qty)
+
+    proj = con.execute("SELECT project_id FROM projects WHERE name=?", (project,)).fetchone()
+    if not proj:
+        raise SystemExit(f"Unknown project: {project} (did you import BOMs?)")
+
+    proj_id = int(proj["project_id"])
+
+    items = con.execute(
+        """
+        SELECT
+          p.part_id,
+          p.part_key,
+          p.value,
+          p.subtype,
+          b.qty_per,
+          s.on_hand
+        FROM bom_items b
+        JOIN parts p ON p.part_id = b.part_id
+        JOIN stock s ON s.part_id = p.part_id
+        WHERE b.project_id = ?
+        ORDER BY p.prefix, p.value, p.subtype
+        """,
+        (proj_id,),
+    ).fetchall()
+
+    if not items:
+        raise SystemExit(f"Project '{project}' has no BOM items.")
+
+    shortages = []
+    deductions = []  # (part_id, need)
+
+    for it in items:
+        need = int(it["qty_per"]) * build_qty
+        have = int(it["on_hand"])
+        new_have = have - need
+
+        deductions.append((int(it["part_id"]), need))
+
+        if new_have < 0:
+            shortages.append((
+                it["part_key"],
+                it["value"],
+                it["subtype"],
+                need,
+                have,
+                -new_have
+            ))
+
+    if shortages and not args.force:
+        print("Build would cause negative inventory. Shortages:")
+        print_table(shortages, ["part_key", "value", "subtype", "needed", "on_hand", "short_by"])
+        con.close()
+        raise SystemExit(2)
+
+    # Apply deductions
+    with con:
+        for part_id, need in deductions:
+            con.execute(
+                "UPDATE stock SET on_hand = on_hand - ? WHERE part_id=?",
+                (need, part_id),
+            )
+
+    con.close()
+    print(f"Built {build_qty}x {project} (inventory deducted).")
+
+    if shortages:
+        print("\n⚠ Shortages (inventory is now negative due to --force):")
+        print_table(shortages, ["part_key", "value", "subtype", "needed", "on_hand", "short_by"])
+
 def build_parser():
     p = argparse.ArgumentParser(description="Inventory Mgmt (Step 1: import BOMs + search).")
     p.add_argument("--db", default="./data/inventory.db", help="SQLite DB path")
@@ -285,6 +360,12 @@ def build_parser():
     s.add_argument("qty", type=int)
     s.add_argument("--loc", help="Storage location label")
     s.set_defaults(func=cmd_receive)
+
+    s = sp.add_parser("build", help="Deduct inventory based on a project BOM x build quantity.")
+    s.add_argument("project", help="Project name (e.g., seaholm)")
+    s.add_argument("qty", type=int, help="How many pedals to build")
+    s.add_argument("--force", action="store_true", help="Allow inventory to go negative")
+    s.set_defaults(func=cmd_build)
 
 
     return p
