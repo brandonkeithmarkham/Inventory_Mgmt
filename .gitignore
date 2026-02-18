@@ -10,3 +10,8 @@ data/
 .DS_Store
 Thumbs.db
 .vscode/
+
+receiving*.csv
+data/
+*.db
+.venv/
